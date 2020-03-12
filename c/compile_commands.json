@@ -1,8 +1,0 @@
-
-[
-{
-  "directory": "/home/benoit/project/code_playground/clean/c",
-  "command": "/usr/bin/c++ -I/usr/include -std=c++1y -o /home/benoit/project/code_playground/clean/c/example.c.o -c /home/benoit/project/code_playground/clean/c/example.c",
-  "file": "/home/benoit/project/code_playground/clean/c/example.c"
-}
-]
