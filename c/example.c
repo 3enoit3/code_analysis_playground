@@ -1,39 +1,63 @@
 // Functions
-bool c_true() {
-    return true;
+int f_true() {
+    return 0;
 }
 
-bool c_call() {
-    return c_true();
+int f_call() {
+    return f_true();
 }
 
 // Structures
-struct c_struct {
-    bool true_field = true;
+struct s_parent; // early declaration
+
+typedef struct s_true {
+    int fd_true;
+} s_true;
+
+struct s_parent {
+    s_true fd_struct;
+    s_true* fd_ptr;
 };
 
-bool c_use_struct() {
-    c_struct a;
-    a.true_field = false;
-    return c_struct().true_field;
+typedef struct s_parent s_parent;
+
+int f_use_struct() {
+    s_true a;
+    a.fd_true = 1;
+
+    s_parent b;
+    b.fd_struct.fd_true = 1;
+
+    s_parent c;
+    c.fd_ptr->fd_true = 1;
+
+    s_parent d;
+    return d.fd_struct.fd_true;
 }
 
-bool c_use_struct2(c_struct* p) {
-    return p->true_field;
+int f_use_struct_as_val(s_parent p) {
+    return p.fd_struct.fd_true;
+}
+
+int f_use_struct_as_ptr(s_parent* p) {
+    return p->fd_ptr->fd_true;
 }
 
 // Globals
-bool c_global_var = true;
-c_struct c_struct_var;
+int g_true = 0;
+s_parent g_struct;
+s_parent* g_ptr;
 
-bool c_global() {
-    c_struct_var.true_field;
-    return c_global_var;
+int f_global() {
+    g_struct.fd_struct.fd_true;
+    g_ptr->fd_ptr->fd_true;
+    return g_true;
 }
 
 // Unkown
-bool c_unknown() {
-    c_unknown_true();
-    c_unknown_struct.c_true_field;
-    return c_unknown_global;
+int unknown() {
+    unknown_f();
+    unknown_s.fd_true;
+    unknown_p->fd_true;
+    return unknown_global;
 }

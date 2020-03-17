@@ -1,0 +1,13 @@
+#!/bin/bash
+
+WDIR="$( pwd )"
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+JSON=compile_commands.json
+SOURCE="$( echo $@ | sed "s/^.*\s\(\S*\.c\)\s.*$/\1/" )"
+
+echo "{
+  \"directory\": \"$WDIR\",
+  \"command\": \"$@\",
+  \"file\": \"$WDIR/$SOURCE\"
+}," >> $DIR/$JSON
+

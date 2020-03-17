@@ -1,143 +1,155 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""Extract symbols from sources using clang"""
 
 import sys
+import argparse
 import clang.cindex as cl
-import collections
+import itertools
+import os
+import unittest
+import logging
+import re
 
-class AstEntry:
-    def __init__(self, kind, name, start, end, type_=""):
-        self.name = name
-        self.kind = kind
-        self.type = type_
-        self.start = start
-        self.end = end
-        self.children = []
-        self.more = []
+# Ast
+CLANG_LIB = '/usr/lib/x86_64-linux-gnu/libclang-6.0.so.1'
+cl.Config.set_library_file(CLANG_LIB)
 
-def harvest_ast(cursor, keep=lambda k: True):
-    def build_entry(cursor):
-        return AstEntry(str(cursor.kind), cursor.displayname, cursor.extent.start.line, cursor.extent.end.line, str(cursor.type.kind))
+def get_compile_cmds(db_path):
+    try:
+        compile_db = cl.CompilationDatabase.fromDirectory(db_path)
+        return True, compile_db.getAllCompileCommands()
+    except cl.CompilationDatabaseError as e:
+        return False, "Cannot find compilation cmds in " + db_path
 
-    def build_root():
-        return AstEntry("root", "root", 0, 0, "root")
+def compile(source, args=[]):
+    try:
+        index = cl.Index.create()
+        tu = index.parse(source, args=args, options=cl.TranslationUnit.PARSE_INCOMPLETE)
+        warnings = list(tu.diagnostics)
+        return True, (tu, index, warnings)
+    except cl.TranslationUnitLoadError as e:
+        return False, "Cannot compile because of exception " + str(e)
 
-    def process_cursor(cursor, parent_entry):
-        if not keep(cursor.kind):
-            return None
-
-        new_entry = build_entry(cursor)
-        if cursor.is_definition():
-            new_entry.more.append(("is_definition", True))
-        if cursor.referenced:
-            new_entry.more.append(("referenced", cursor.referenced.displayname))
-
-        parent_entry.children.append(new_entry)
-        return new_entry
-
-    def walk_tree(cursor, parent_entry, level = 0):
-        new_entry = process_cursor(cursor, parent_entry)
-        if new_entry:
-            parent_entry = new_entry
+def walk_ast(tu, capture_cursor=lambda c, ps: None):
+    def walk(cursor, parents):
+        capture = capture_cursor(cursor, parents)
+        if capture:
+            yield capture
 
         for child in cursor.get_children():
-            walk_tree(child, parent_entry, level+1)
+            yield from walk(child, parents + [(cursor, capture)])
 
-    root = build_root()
-    walk_tree(cursor, root)
-    return root
+    yield from walk(tu.cursor, [])
 
-def print_entries(entries):
-    def format_entry(e):
-        return "{} [{}:{}] [{}:{}] {}".format(e.name, e.kind, e.type, e.start, e.end, e.more if e.more else "")
+# Generators with side effects
+def gen_compile_cmds(db_path):
+    ok, extra = get_compile_cmds(db_path)
+    if ok:
+        cmds = extra
+        yield from cmds
+    else:
+        logging.warning(extra)
 
-    def print_entry(root, level = 0):
-        print("{}{}".format(level * "  ", format_entry(root)))
-        for child in root.children:
-            print_entry(child, level+1)
+def gen_units(cmds):
+    for cmd in cmds:
+        ok, extra = compile(cmd.filename)
+        if ok:
+            tu, index, warnings = extra
+            if warnings:
+                logging.warning("[{}]: {}".format(cmd.filename, list(warnings)))
+            yield tu
+        else:
+            logging.warning("[{}]: {}".format(cmd.filename, extra))
 
-    print_entry(entries)
+def gen_captures(units, capture_cursor):
+    for tu in units:
+        yield from walk_ast(tu, capture_cursor)
 
-def harvest_entries(root):
-    def walk_tree(entry):
-        if entry.kind == "CursorKind.STRUCT_DECL":
-            yield entry
+# Collect
+def collect(captures):
+    names = {}
+    for capture in captures:
+        new_name = [v for k, v in capture if k=="name"][0]
 
-        for child in entry.children:
-            yield from walk_tree(child)
+        props = names.get(new_name)
+        if props:
+            if props != capture:
+                logging.warning("Collision: same name, different properties ({} vs {})".format(capture, props))
+        else:
+            names[new_name] = capture
 
-    yield from walk_tree(root)
+    nodes = [names[n] for n in sorted(names.keys())]
+    return nodes
 
-class Compiler:
-    def __init__(self, source):
-        self.source = source
-        CLANG_LIB = '/usr/lib/x86_64-linux-gnu/libclang-6.0.so.1'
-        cl.Config.set_library_file(CLANG_LIB)
+# Main
+def main():
+    """Entry point"""
 
-    def get_compile_cmds(self, db_path):
-        try:
-            compile_db = cl.CompilationDatabase.fromDirectory(db_path)
-            return compile_db.getCompileCommands(source)
-        except cl.CompilationDatabaseError as e:
-            print("PARAM WARNING:")
-            print("  Cannot find compilation cmds for {} in {} - ignoring it".format(source, db_path))
-            return []
+    # Parse options
+    parser = argparse.ArgumentParser()
+    parser.add_argument("codebase_path", type=str,
+                        help="path of the codebase")
+    parser.add_argument("-f", "--filter_path", type=str, default='.*',
+                        help="filter source path")
+    parser.add_argument("-d", "--debug", action="store_true", default=False,
+                        help="show debug information")
+    args = parser.parse_args()
 
-    def compile(self, args=[]):
-        try:
-            index = cl.Index.create()
-            tu = index.parse(source, args=compile_args, options=cl.TranslationUnit.PARSE_INCOMPLETE)
-            warnings = list(tu.diagnostics)
-            return tu, warnings
-        except cl.TranslationUnitLoadError as e:
-            return None, str(e)
+    # Configure debug
+    if args.debug:
+        logging.basicConfig(stream=sys.stderr, level=logging.DEBUG)
+        logging.debug("Enabled debug logging")
 
-def clean_compile_cmds(cmds):
-    if not cmds:
-        return []
-    return [a for a in compile_cmds[0].arguments if a.startswith("-I")]
+    # Logic
+    filter_re = re.compile(args.filter_path)
+    def keep_file(path):
+        return filter_re.search(path) is not None
 
-if __name__ == '__main__':
-    db_path = sys.argv[1]
-    source = sys.argv[2]
+    def keep_cursor(cursor):
+        return cursor.location and cursor.location.file and cursor.location.file.name.startswith(args.codebase_path)
 
-    compiler = Compiler(source)
-    compile_cmds = compiler.get_compile_cmds(db_path)
-    compile_args = clean_compile_cmds(compile_cmds)
-    tu, info = compiler.compile(compile_args)
-    if not tu:
-        print("ERROR: failed to compile because of", info)
-        sys.exit(1)
-    if info:
-        print("COMPILATION WARNINGS:")
-        for d in info:
-            print(" ", d)
-        print()
+    def capture_cursor(cursor, parents):
+        if not keep_cursor(cursor):
+            return None
 
-    interesting_kinds = [ cl.CursorKind.TRANSLATION_UNIT,
-            cl.CursorKind.CLASS_DECL,
-            cl.CursorKind.CONSTRUCTOR,
-            cl.CursorKind.DESTRUCTOR,
-            cl.CursorKind.CXX_METHOD,
-            cl.CursorKind.FIELD_DECL,
-            cl.CursorKind.DECL_REF_EXPR,
-            cl.CursorKind.VAR_DECL,
-            cl.CursorKind.TYPE_REF,
-            cl.CursorKind.MEMBER_REF_EXPR,
-            cl.CursorKind.FUNCTION_DECL,
-            # cl.CursorKind.CALL_EXPR,
-            cl.CursorKind.NAMESPACE,
-            cl.CursorKind.STRUCT_DECL,
-            cl.CursorKind.PARM_DECL,
-            ]
+        clean_location = lambda loc: os.path.realpath(loc.file.name) + ":" + str(loc.line) if loc and loc.file else "none"
 
-    debug = False
-    if debug:
-        root = harvest_ast(tu.cursor)
-        print_entries(root)
-        print()
+        if args.debug:
+            logging.debug("{}{} [{}] at {}".format("  " * len(parents),
+                cursor.displayname,
+                str(cursor.kind),
+                clean_location(cursor.location)))
 
-    root = harvest_ast(tu.cursor, lambda k: k in interesting_kinds)
-    print_entries(root)
-    print()
+        if cursor.kind == cl.CursorKind.STRUCT_DECL and cursor.is_definition():
+            if cursor.displayname:
+                return [('name', cursor.displayname), ('location', clean_location(cursor.location))]
+        return None
 
-    for n in harvest_entries(root):
-        print(n.name)
+    cmds = (c for c in gen_compile_cmds(args.codebase_path) if keep_file(c.filename))
+    units = gen_units(cmds)
+    captures = gen_captures(units, capture_cursor)
+    nodes = collect(captures)
+
+    for n in nodes:
+        print(n)
+
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+class Tests(unittest.TestCase):
+    # pylint: disable=too-many-public-methods
+    """Unit tests"""
+    # run test suite with
+    # python -m unittest <this_module_name_without_py_extension>
+
+    def setUp(self):
+        logging.basicConfig(stream=sys.stderr, level=logging.DEBUG)
+
+    def test(self):
+        """Scenario"""
+        self.assertTrue(True is True)
+        self.assertEqual(True, True)
