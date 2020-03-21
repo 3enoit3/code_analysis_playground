@@ -15,7 +15,8 @@ typedef struct s_true {
 } s_true;
 
 struct s_parent {
-    s_true fd_struct;
+    struct s_true fd_struct;
+    s_true fd_typedef;
     s_true* fd_ptr;
 };
 

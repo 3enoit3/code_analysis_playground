@@ -33,15 +33,10 @@ def compile(source, args=[]):
     except cl.TranslationUnitLoadError as e:
         return False, "Cannot compile because of exception " + str(e)
 
-class Capture(enum.Enum):
-    SYMBOL = 0
-    REFERENCE = 1
-    STOP_WALKING = -1
-
-def walk_ast(tu, capture_cursor=lambda c, ps: None):
+def walk_ast(tu, capture_cursor=lambda c, ps: None, walking_poison_pill=None):
     def walk(cursor, parents):
         for capture in capture_cursor(cursor, parents):
-            if capture == (Capture.STOP_WALKING, []):
+            if capture == walking_poison_pill:
                 return
             yield capture
 
@@ -70,51 +65,93 @@ def gen_units(cmds):
         else:
             logging.warning("[{}]: {}".format(cmd.filename, extra))
 
-def gen_captures(units, capture_cursor):
+def gen_captures(units, capture_cursor, walking_poison_pill):
     for tu in units:
-        yield from walk_ast(tu, capture_cursor)
+        yield from walk_ast(tu, capture_cursor, walking_poison_pill)
 
 # Captures
+class Capture(enum.IntEnum):
+    SYMBOL = 0
+    REFERENCE = 1
+
+class Reference(enum.IntEnum):
+    AGGREGATION = 0
+    ASSOCIATION = 1
+
+class Type(enum.IntEnum):
+    STRUCT = 0
+    TYPEDEF = 1
+    UNKNOWN = -1
+
+STOP_WALKING = (None, [])
+
 def location(cursor):
     loc = cursor.location
     if loc and loc.file:
         return os.path.realpath(loc.file.name) + ":" + str(loc.line)
     return "none"
 
-def basic_capture(cursor):
-    return [('name', cursor.displayname), ('type', str(cursor.kind)), ('location', location(cursor))]
+def id_from_type_ref(cursor):
+    name = cursor.displayname
+    if name.startswith("struct "):
+        return name[7:], Type.STRUCT
+    if cursor.type.kind == cl.TypeKind.TYPEDEF:
+        return name, Type.TYPEDEF
+    return name, Type.UNKNOWN
+
+def descendants(cursor):
+    yield from itertools.islice(cursor.walk_preorder(), 1, None)
 
 def capture_struct(cursor):
-    yield Capture.SYMBOL, basic_capture(cursor) + [('id', cursor.displayname + "#S")]
-    yield Capture.STOP_WALKING, []
+    id = (cursor.displayname, Type.STRUCT)
+
+    yield Capture.SYMBOL, [
+            ('id', id),
+            ('location', location(cursor))]
+
+    for desc in descendants(cursor):
+        if desc.kind == cl.CursorKind.FIELD_DECL:
+            for subdesc in descendants(desc):
+                if subdesc.kind == cl.CursorKind.TYPE_REF:
+                    yield Capture.REFERENCE, [
+                            ("from", id),
+                            ("to", id_from_type_ref(subdesc)),
+                            ("type", Reference.ASSOCIATION if desc.type.kind == cl.TypeKind.POINTER else Reference.AGGREGATION),
+                            ("name", desc.displayname)]
+                    break
+    yield STOP_WALKING
 
 def capture_typedef(cursor):
-    capture = basic_capture(cursor)
-    for desc in itertools.islice(cursor.walk_preorder(), 1, None):
-        if desc.kind == cl.CursorKind.TYPE_REF:
-            capture.append(("org", desc.displayname[7:] + "#S" if desc.displayname.startswith("struct ") else desc.displayname))
-            break
-        if desc.kind == cl.CursorKind.STRUCT_DECL:
-            capture.append(("org", desc.displayname + "#S"))
-            break
-    yield Capture.SYMBOL, capture + [('id', cursor.displayname + "#T")]
-    yield Capture.STOP_WALKING, []
+    id = (cursor.displayname, Type.TYPEDEF)
+
+    def get_origin(cursor):
+        for desc in descendants(cursor):
+            if desc.kind == cl.CursorKind.TYPE_REF:
+                return id_from_type_ref(desc)
+            if desc.kind == cl.CursorKind.STRUCT_DECL:
+                return desc.displayname, Type.STRUCT
+
+    yield Capture.SYMBOL, [
+            ('id', id),
+            ('location', location(cursor)),
+            ('org', get_origin(cursor))]
+    yield STOP_WALKING
 
 # Collect
 def collect(captures):
     ids = {}
+    aliases = {}
+    links = {}
     for capture, props in captures:
-        if capture != Capture.SYMBOL:
-            continue
+        if capture == Capture.SYMBOL:
+            new_id = [v for k, v in props if k=="id"][0]
 
-        new_id = [v for k, v in props if k=="id"][0]
-
-        old_props = ids.get(new_id)
-        if old_props:
-            if old_props != props:
-                logging.warning("Collision: same id, different properties ({} vs {})".format(props, old_props))
-        else:
-            ids[new_id] = props
+            old_props = ids.get(new_id)
+            if old_props:
+                if old_props != props:
+                    logging.warning("Collision: same id, different properties ({} vs {})".format(props, old_props))
+            else:
+                ids[new_id] = props
 
     nodes = [ids[n] for n in sorted(ids.keys())]
     return nodes
@@ -139,9 +176,9 @@ def main():
         logging.debug("Enabled debug logging")
 
     # Logic
-    filter_re = re.compile(args.filter_path)
+    path_re = re.compile(args.filter_path)
     def keep_file(path):
-        return filter_re.search(path) is not None
+        return path_re.search(path) is not None
 
     def keep_cursor(cursor):
         return cursor.location and cursor.location.file and cursor.location.file.name.startswith(args.codebase_path)
@@ -166,7 +203,7 @@ def main():
 
     cmds = (c for c in gen_compile_cmds(args.codebase_path) if keep_file(c.filename))
     units = gen_units(cmds)
-    captures = gen_captures(units, capture_cursor)
+    captures = gen_captures(units, capture_cursor, STOP_WALKING)
     nodes = collect(captures)
 
     for n in nodes:
