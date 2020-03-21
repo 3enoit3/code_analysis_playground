@@ -20,6 +20,11 @@ struct s_parent {
 };
 
 typedef struct s_parent s_parent;
+typedef struct s_parent t_redefined;
+typedef t_redefined t_re_redefined;
+
+struct s_forward;
+typedef struct s_forward t_forward;
 
 int f_use_struct() {
     s_true a;
