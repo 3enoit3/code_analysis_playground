@@ -67,7 +67,17 @@ def gen_units(cmds):
 
 def gen_captures(units, capture_cursor, walking_poison_pill):
     for tu in units:
+        logging.info("walking " + str(tu))
         yield from walk_ast(tu, capture_cursor, walking_poison_pill)
+        logging.info("walked " + str(tu))
+
+def gen_unique(captures):
+    known = set()
+    for type, props in captures:
+        key = (type, tuple(props))
+        if key not in known:
+            known.add(key)
+            yield (type, props)
 
 # Captures
 class Capture(enum.IntEnum):
@@ -75,8 +85,10 @@ class Capture(enum.IntEnum):
     REFERENCE = 1
 
 class Reference(enum.IntEnum):
-    AGGREGATION = 0
-    ASSOCIATION = 1
+    ASSOCIATION = 0 # flat
+    AGGREGATION = 1 # empty diamond
+    COMPOSITION = 2 # plain diamond
+    GENERALIZATION = 3 # triangle
 
 class Type(enum.IntEnum):
     STRUCT = 0
@@ -116,7 +128,7 @@ def capture_struct(cursor):
                     yield Capture.REFERENCE, [
                             ("from", id),
                             ("to", id_from_type_ref(subdesc)),
-                            ("type", Reference.ASSOCIATION if desc.type.kind == cl.TypeKind.POINTER else Reference.AGGREGATION),
+                            ("type", Reference.AGGREGATION if desc.type.kind == cl.TypeKind.POINTER else Reference.COMPOSITION),
                             ("name", desc.displayname)]
                     break
     yield STOP_WALKING
@@ -138,23 +150,76 @@ def capture_typedef(cursor):
     yield STOP_WALKING
 
 # Collect
-def collect(captures):
-    ids = {}
-    aliases = {}
-    links = {}
+def get_field(props, field):
+    return [v for k, v in props if k == field][0]
+
+def merge(captures):
+    symbols = {}
+    references = {}
+
+    def add_symbol(props):
+        dict_props = dict(props)
+        new_id = dict_props["id"]
+        old_props = symbols.get(new_id)
+        if old_props:
+            if old_props != props:
+                logging.warning("Collision: same id, different properties ({} vs {})".format(props, old_props))
+        else:
+            symbols[new_id] = props
+
+    def add_reference(props):
+        dict_props = dict(props)
+        new_id = (dict_props["from"], dict_props["to"], dict_props["type"])
+        references[new_id] = props
+
     for capture, props in captures:
         if capture == Capture.SYMBOL:
-            new_id = [v for k, v in props if k=="id"][0]
+            add_symbol(props)
+        elif capture == Capture.REFERENCE:
+            add_reference(props)
 
-            old_props = ids.get(new_id)
-            if old_props:
-                if old_props != props:
-                    logging.warning("Collision: same id, different properties ({} vs {})".format(props, old_props))
-            else:
-                ids[new_id] = props
+    return symbols, references
 
-    nodes = [ids[n] for n in sorted(ids.keys())]
-    return nodes
+def graph(symbols, references):
+    nodes = {}
+    symbol_id_to_node_id = {}
+    edges = []
+
+    def get_node_id(symbol):
+        name, type = get_field(symbol, "id")
+        return name + ":" + str(type)
+
+    def add_node(symbol):
+        id = get_field(symbol, "id")
+        name, type = id
+        while type == Type.TYPEDEF:
+            # resolve it
+            org_id = get_field(symbol, "org")
+            if org_id == id:
+                break
+
+            org_symbol = symbols.get(org_id)
+            if not org_symbol:
+                break
+
+            symbol = org_symbol
+            id = get_field(symbol, "id")
+            name, type = id
+
+        node_id = get_node_id(symbol)
+        old_node = nodes.get(node_id)
+        if not old_node:
+            nodes[node_id] = node_id
+        return node_id
+
+    for reference in references.values():
+        from_id = get_field(reference, "from")
+        from_node_id = add_node(symbols[from_id])
+        to_id = get_field(reference, "to")
+        to_node_id = add_node(symbols[to_id])
+        edges.append((from_node_id, to_node_id, get_field(reference, "type"), get_field(reference, "name")))
+
+    return nodes, edges
 
 # Main
 def main():
@@ -174,6 +239,8 @@ def main():
     if args.debug:
         logging.basicConfig(stream=sys.stderr, level=logging.DEBUG)
         logging.debug("Enabled debug logging")
+    else:
+        logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 
     # Logic
     path_re = re.compile(args.filter_path)
@@ -204,11 +271,20 @@ def main():
     cmds = (c for c in gen_compile_cmds(args.codebase_path) if keep_file(c.filename))
     units = gen_units(cmds)
     captures = gen_captures(units, capture_cursor, STOP_WALKING)
-    nodes = collect(captures)
+    # captures = gen_unique(captures)
+    # with open("captures.txt", "w") as out:
+        # for t, p in captures:
+            # print(str(t) + ":" + str(p))
+            # out.write(str(t) + ":" + str(p) + "\n")
+    # return 0
+
+    symbols, references = merge(captures)
+    nodes, edges = graph(symbols, references)
 
     for n in nodes:
         print(n)
-
+    for f, t, a, n in edges:
+        print('{} -> {};'.format(f.split(":")[0], t.split(":")[0]))
     return 0
 
 if __name__ == "__main__":
